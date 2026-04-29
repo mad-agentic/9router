@@ -5,6 +5,7 @@ import { cloakClaudeTools } from "../utils/claudeCloaking.js";
 import { filterToOpenAIFormat } from "./helpers/openaiHelper.js";
 import { normalizeThinkingConfig } from "../services/provider.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
+import { compressMessages, formatRtkLog } from "../rtk/index.js";
 
 // Registry for translators
 const requestRegistry = new Map();
@@ -52,37 +53,37 @@ function ensureInitialized() {
   require("./response/ollama-to-openai.js");
 }
 
-// Strip multimodal content blocks (image/audio/video) from messages if model doesn't support them
-function stripUnsupportedMultimodal(body, multimodal = {}) {
-  if (!body.messages || !Array.isArray(body.messages)) return;
+// Strip specific content types from messages (explicit opt-in via strip[] in PROVIDER_MODELS)
+function stripContentTypes(body, stripList = []) {
+  if (!stripList.length || !body.messages || !Array.isArray(body.messages)) return;
+  const imageTypes = new Set(["image_url", "image"]);
+  const audioTypes = new Set(["audio_url", "input_audio"]);
+  const shouldStrip = (type) => {
+    if (imageTypes.has(type)) return stripList.includes("image");
+    if (audioTypes.has(type)) return stripList.includes("audio");
+    return false;
+  };
   for (const msg of body.messages) {
     if (!Array.isArray(msg.content)) continue;
-    msg.content = msg.content.filter(part => {
-      if (part.type === "image_url" || part.type === "image") return multimodal.image === true;
-      if (part.type === "audio_url" || part.type === "input_audio") return multimodal.audio === true;
-      return true; // keep text, tool_use, tool_result, etc.
-    });
-    // If content array becomes empty after filtering, replace with empty string to avoid API errors
+    msg.content = msg.content.filter(part => !shouldStrip(part.type));
     if (msg.content.length === 0) msg.content = "";
   }
 }
 
 // Translate request: source -> openai -> target
-export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, caps = null, connectionId = null) {
+export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, rtkEnabled = false, clientTool = null) {
   ensureInitialized();
   let result = body;
 
-  // Apply model capability guards before translation
-  if (caps) {
-    // Strip multimodal content if model doesn't support it
-    stripUnsupportedMultimodal(result, caps.multimodal || {});
-
-    // Strip thinking config if model doesn't support thinking
-    if (!caps.thinking) {
-      delete result.thinking;
-      delete result.reasoning_effort;
-    }
+  // RTK: compress tool_result content before any translation (shape-agnostic)
+  const rtkStats = compressMessages(result, rtkEnabled);
+  if (rtkStats) {
+    const line = formatRtkLog(rtkStats);
+    if (line) console.log(line);
   }
+
+  // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
+  stripContentTypes(result, stripList);
 
   // Normalize thinking config: remove if lastMessage is not user
   normalizeThinkingConfig(result);
@@ -139,15 +140,14 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
     }
   }
 
-  // Antigravity cloaking: rename client tools + inject decoys (anti-ban)
-  // Skip if client is native AG (userAgent = antigravity)
-  if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
-    const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
-    result = cloakedBody;
-    if (toolNameMap?.size > 0) {
-      result._toolNameMap = toolNameMap;
-    }
-  }
+  // Antigravity cloaking disabled
+  // if (provider === FORMATS.ANTIGRAVITY && body.userAgent !== FORMATS.ANTIGRAVITY) {
+  //   const { cloakedBody, toolNameMap } = AntigravityExecutor.cloakTools(result);
+  //   result = cloakedBody;
+  //   if (toolNameMap?.size > 0) {
+  //     result._toolNameMap = toolNameMap;
+  //   }
+  // }
 
   return result;
 }
